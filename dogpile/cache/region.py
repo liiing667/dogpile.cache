@@ -206,6 +206,22 @@ class RegionInvalidationStrategy:
 
         raise NotImplementedError()
 
+    def soft_invalidation_time(self) -> float | None:
+        """Return the timestamp of the most recent soft invalidation.
+
+        :return: a ``time.time()`` timestamp indicating when the region
+         was most recently invalidated in soft mode, or None if the
+         region is not currently soft invalidated, or if the strategy
+         does not track this information.
+
+         This is used by the stale-while-revalidate feature of
+         :class:`.CacheRegion` to determine the start of the window
+         during which stale values may be served.  Strategies that
+         return None here disable that feature.
+
+        """
+        return None
+
 
 class DefaultInvalidationStrategy(RegionInvalidationStrategy):
     def __init__(self):
@@ -230,6 +246,51 @@ class DefaultInvalidationStrategy(RegionInvalidationStrategy):
 
     def is_soft_invalidated(self, timestamp: float) -> bool:
         return self.was_soft_invalidated() and self.is_invalidated(timestamp)
+
+    def soft_invalidation_time(self) -> float | None:
+        if self.was_soft_invalidated():
+            return cast(float, self._invalidated)
+        else:
+            return None
+
+
+class RegionStats:
+    """Thread-safe statistics counters for a :class:`.CacheRegion`.
+
+    The counters are plain integers that may be read directly;
+    increments are performed under a mutex so that they remain
+    consistent under concurrent threads.
+
+    .. versionadded:: 1.6
+
+    """
+
+    stale_hits: int
+    """Number of times a stale value was served within the
+    stale-while-revalidate window."""
+
+    refreshes: int
+    """Number of single-flight refresh attempts that were started."""
+
+    refresh_errors: int
+    """Number of refresh attempts that raised an error."""
+
+    def __init__(self) -> None:
+        self._mutex = threading.Lock()
+        self.stale_hits = 0
+        self.refreshes = 0
+        self.refresh_errors = 0
+
+    def _increment(self, counter: str) -> None:
+        with self._mutex:
+            setattr(self, counter, getattr(self, counter) + 1)
+
+    def reset(self) -> None:
+        """Reset all counters to zero."""
+        with self._mutex:
+            self.stale_hits = 0
+            self.refreshes = 0
+            self.refresh_errors = 0
 
 
 class CacheRegion:
@@ -394,6 +455,36 @@ class CacheRegion:
      .. versionadded:: 0.4.2 added the async_creation_runner
         feature.
 
+    :param stale_while_revalidate: Optional.  Number of seconds,
+     or a ``datetime.timedelta`` value, establishing a window of time
+     following a soft invalidation (see :meth:`.CacheRegion.invalidate`)
+     during which :meth:`.CacheRegion.get_or_create` will return the
+     stale value immediately, while a single refresh of the value is
+     triggered.  The refresh is deferred to the
+     :paramref:`.CacheRegion.async_creation_runner` if one is configured,
+     and is otherwise performed synchronously by a single caller.
+
+     The stale value is only served while it has not also reached its
+     natural expiration time;  a value that is hard invalidated or
+     expired is always regenerated using the regular dogpile lock
+     behavior.  If a refresh fails, the stale value continues to be
+     served and the cached entry is left untouched.
+
+     This option has no effect when the effective expiration time
+     is None (i.e. values never expire), as soft invalidation itself
+     requires a non-None expiration time.
+
+     .. versionadded:: 1.6
+
+    :param single_flight: if True (the default), only one caller across
+     all threads and processes sharing this cache is elected to refresh
+     a stale value within the stale-while-revalidate window;  all other
+     callers are served the stale value immediately.  If False, no
+     election takes place and every caller that encounters the stale
+     value may trigger its own refresh.
+
+     .. versionadded:: 1.6
+
     """
 
     def __init__(
@@ -405,6 +496,8 @@ class CacheRegion:
         serializer: Callable[[ValuePayload], bytes] | None = None,
         deserializer: Callable[[bytes], ValuePayload] | None = None,
         async_creation_runner: AsyncCreator | None = None,
+        stale_while_revalidate: float | datetime.timedelta | None = None,
+        single_flight: bool = True,
     ):
         """Construct a new :class:`.CacheRegion`."""
         self.name = name
@@ -414,6 +507,11 @@ class CacheRegion:
         self.serializer = self._user_defined_serializer = serializer
         self.deserializer = self._user_defined_deserializer = deserializer
         self.async_creation_runner = async_creation_runner
+        if isinstance(stale_while_revalidate, datetime.timedelta):
+            stale_while_revalidate = stale_while_revalidate.total_seconds()
+        self.stale_while_revalidate = stale_while_revalidate
+        self.single_flight = single_flight
+        self.stats = RegionStats()
         self.region_invalidator: RegionInvalidationStrategy = (
             DefaultInvalidationStrategy()
         )
@@ -1041,6 +1139,15 @@ class CacheRegion:
                         "Non-None expiration time required "
                         "for soft invalidation"
                     )
+                if self._is_stale_while_revalidate(ct, expiration_time):
+                    return self._stale_while_revalidate_response(
+                        key,
+                        orig_key,
+                        cast(CachedValue, value),
+                        creator,
+                        creator_args,
+                        should_cache_fn,
+                    )
                 ct = time.time() - expiration_time - 0.0001
 
             return value.payload, ct
@@ -1102,6 +1209,102 @@ class CacheRegion:
             async_creator,
         ) as value:
             return value
+
+    def _is_stale_while_revalidate(
+        self, ct: float, expiration_time: float
+    ) -> bool:
+        """Return True if a soft-invalidated value may be served stale
+        within the stale-while-revalidate window."""
+        if self.stale_while_revalidate is None:
+            return False
+        soft_invalidated_at = self.region_invalidator.soft_invalidation_time()
+        if soft_invalidated_at is None:
+            return False
+        now = time.time()
+        return (
+            now - ct <= expiration_time
+            and now - soft_invalidated_at <= self.stale_while_revalidate
+        )
+
+    def _stale_while_revalidate_response(
+        self,
+        key: KeyType,
+        orig_key: KeyType,
+        value: CachedValue,
+        creator: Callable[..., ValuePayload],
+        creator_args: tuple[Any, Mapping[str, Any]] | None,
+        should_cache_fn: Callable[[ValuePayload], bool] | None,
+    ) -> tuple[ValuePayload, float]:
+        """Serve a stale value within the stale-while-revalidate window.
+
+        Returns a ``(payload, createdtime)`` tuple where ``createdtime``
+        reads as "fresh", so that the dogpile lock returns the payload
+        to the caller immediately.  As a side effect, a refresh of the
+        value is triggered, limited to a single caller when
+        :paramref:`.CacheRegion.single_flight` is enabled.  The refresh
+        is deferred to the
+        :paramref:`.CacheRegion.async_creation_runner` if one is
+        configured, and is otherwise performed synchronously, in which
+        case the newly created value is returned.  A failed refresh
+        leaves the cached entry untouched and the stale value is
+        returned.
+        """
+        self.stats._increment("stale_hits")
+        now = time.time()
+
+        if self.single_flight:
+            mutex = self._mutex(key)
+            if not mutex.acquire(False):
+                # another thread or process is already refreshing
+                return value.payload, now
+        else:
+            mutex = self._LockWrapper()
+            mutex.acquire(False)
+
+        if self.async_creation_runner is not None:
+            self.stats._increment("refreshes")
+
+            def go():
+                try:
+                    if creator_args:
+                        return creator(*creator_args[0], **creator_args[1])
+                    else:
+                        return creator()
+                except Exception:
+                    self.stats._increment("refresh_errors")
+                    raise
+
+            try:
+                self.async_creation_runner(self, orig_key, go, mutex)
+            except Exception:
+                mutex.release()
+                self.stats._increment("refresh_errors")
+                log.exception(
+                    "async_creation_runner failed for key %r; "
+                    "serving stale value",
+                    orig_key,
+                )
+            return value.payload, now
+
+        self.stats._increment("refreshes")
+        try:
+            if creator_args:
+                created = creator(*creator_args[0], **creator_args[1])
+            else:
+                created = creator()
+            if should_cache_fn is None or should_cache_fn(created):
+                self._set_cached_value_to_backend(key, self._value(created))
+            return created, now
+        except Exception:
+            self.stats._increment("refresh_errors")
+            log.exception(
+                "Error refreshing stale value for key %r; "
+                "serving stale value",
+                orig_key,
+            )
+            return value.payload, now
+        finally:
+            mutex.release()
 
     def get_or_create_multi(
         self,

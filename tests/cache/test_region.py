@@ -3,6 +3,7 @@ import configparser
 import datetime
 import io
 import itertools
+import threading
 import time
 from unittest import mock
 
@@ -566,6 +567,257 @@ class RegionTest:
             eq_(value_metadata.payload, "some value")
             eq_(value_metadata.cached_time, 100)
             eq_(value_metadata.age, 5)
+
+
+class StaleWhileRevalidateTest:
+    def _region(self, init_args={}, config_args={}):
+        config_args = dict(config_args)
+        config_args.setdefault("expiration_time", 10)
+        reg = CacheRegion(**init_args)
+        reg.configure("dogpile.cache.memory", **config_args)
+        return reg
+
+    def test_stale_served_and_background_refresh(self):
+        handoffs = []
+
+        def async_creation_runner(cache, key, creator, mutex):
+            handoffs.append((creator, mutex))
+
+        reg = self._region(
+            init_args={
+                "stale_while_revalidate": 10,
+                "async_creation_runner": async_creation_runner,
+            }
+        )
+        counter = itertools.count(1)
+
+        def creator():
+            return "some value %d" % next(counter)
+
+        eq_(reg.get_or_create("some key", creator), "some value 1")
+        time.sleep(0.05)
+        reg.invalidate(hard=False)
+
+        # the stale value is served immediately and exactly one
+        # refresh is handed off to the async runner
+        eq_(reg.get_or_create("some key", creator), "some value 1")
+        eq_(reg.get_or_create("some key", creator), "some value 1")
+        eq_(len(handoffs), 1)
+
+        eq_(reg.stats.stale_hits, 2)
+        eq_(reg.stats.refreshes, 1)
+        eq_(reg.stats.refresh_errors, 0)
+
+        # complete the deferred refresh
+        refresh_creator, mutex = handoffs[0]
+        reg.set("some key", refresh_creator())
+        mutex.release()
+
+        eq_(reg.get_or_create("some key", creator), "some value 2")
+        eq_(len(handoffs), 1)
+
+    def test_foreground_refresh_returns_new_value(self):
+        reg = self._region(init_args={"stale_while_revalidate": 10})
+        counter = itertools.count(1)
+
+        def creator():
+            return "some value %d" % next(counter)
+
+        eq_(reg.get_or_create("some key", creator), "some value 1")
+        time.sleep(0.05)
+        reg.invalidate(hard=False)
+
+        # the single caller is elected to refresh synchronously and
+        # receives the new value
+        eq_(reg.get_or_create("some key", creator), "some value 2")
+        eq_(reg.stats.stale_hits, 1)
+        eq_(reg.stats.refreshes, 1)
+        eq_(reg.stats.refresh_errors, 0)
+        eq_(reg.get_or_create("some key", creator), "some value 2")
+
+    def test_single_flight_concurrent(self):
+        reg = self._region(init_args={"stale_while_revalidate": 10})
+        reg.get_or_create("some key", lambda: "old value")
+        time.sleep(0.05)
+        reg.invalidate(hard=False)
+
+        entered = threading.Event()
+        release = threading.Event()
+        creator_calls = []
+
+        def creator():
+            creator_calls.append(1)
+            entered.set()
+            release.wait(5)
+            return "new value"
+
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                results.append(reg.get_or_create("some key", creator))
+            except Exception as err:
+                errors.append(err)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        assert entered.wait(5)
+        time.sleep(0.2)
+        # only one caller is refreshing; the rest got the stale value
+        eq_(len(creator_calls), 1)
+        eq_(results, ["old value"] * 4)
+        release.set()
+        for t in threads:
+            t.join()
+        eq_(errors, [])
+        eq_(sorted(results), ["new value"] + ["old value"] * 4)
+        eq_(reg.stats.stale_hits, 5)
+        eq_(reg.stats.refreshes, 1)
+        eq_(reg.stats.refresh_errors, 0)
+
+    def test_single_flight_disabled(self):
+        reg = self._region(
+            init_args={"stale_while_revalidate": 10, "single_flight": False}
+        )
+        reg.get_or_create("some key", lambda: "old value")
+        time.sleep(0.05)
+        reg.invalidate(hard=False)
+
+        creator_calls = []
+
+        def creator():
+            creator_calls.append(1)
+            time.sleep(0.3)
+            return "new value"
+
+        def worker():
+            reg.get_or_create("some key", creator)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # without single-flight election, both callers ran their
+        # own refresh
+        eq_(len(creator_calls), 2)
+        eq_(reg.stats.refreshes, 2)
+
+    def test_refresh_error_keeps_stale_value(self):
+        reg = self._region(init_args={"stale_while_revalidate": 10})
+        reg.get_or_create("some key", lambda: "old value")
+        time.sleep(0.05)
+        reg.invalidate(hard=False)
+
+        creator_calls = []
+
+        def creator():
+            creator_calls.append(1)
+            raise RuntimeError("boom")
+
+        # a failed refresh serves the stale value and leaves the
+        # cached entry untouched
+        eq_(reg.get_or_create("some key", creator), "old value")
+        eq_(reg.get("some key", ignore_expiration=True), "old value")
+
+        # the next hit retries the refresh
+        eq_(reg.get_or_create("some key", creator), "old value")
+        eq_(len(creator_calls), 2)
+        eq_(reg.stats.stale_hits, 2)
+        eq_(reg.stats.refreshes, 2)
+        eq_(reg.stats.refresh_errors, 2)
+
+        # a working creator succeeds on the next retry
+        eq_(reg.get_or_create("some key", lambda: "new value"), "new value")
+        eq_(reg.stats.refreshes, 3)
+        eq_(reg.stats.refresh_errors, 2)
+
+    def test_hard_invalidation_uses_full_rebuild(self):
+        reg = self._region(init_args={"stale_while_revalidate": 10})
+        reg.get_or_create("some key", lambda: "old value")
+        time.sleep(0.05)
+        reg.invalidate(hard=True)
+        eq_(reg.get_or_create("some key", lambda: "new value"), "new value")
+        eq_(reg.stats.stale_hits, 0)
+        eq_(reg.stats.refreshes, 0)
+
+    def test_natural_expiration_uses_full_rebuild(self):
+        reg = self._region(
+            init_args={"stale_while_revalidate": 10},
+            config_args={"expiration_time": 0.2},
+        )
+        reg.get_or_create("some key", lambda: "old value")
+        time.sleep(0.3)
+        reg.invalidate(hard=False)
+        # the value is past its natural expiration time, so the
+        # stale-while-revalidate window does not apply
+        eq_(reg.get_or_create("some key", lambda: "new value"), "new value")
+        eq_(reg.stats.stale_hits, 0)
+
+    def test_window_expiry_falls_back_to_normal_refresh(self):
+        reg = self._region(init_args={"stale_while_revalidate": 0.2})
+        reg.get_or_create("some key", lambda: "old value")
+        time.sleep(0.05)
+        reg.invalidate(hard=False)
+        time.sleep(0.25)
+        # outside the stale-while-revalidate window, the regular
+        # soft-invalidation behavior applies
+        eq_(reg.get_or_create("some key", lambda: "new value"), "new value")
+        eq_(reg.stats.stale_hits, 0)
+
+    def test_none_expiration_disables_stale_while_revalidate(self):
+        reg = self._region(
+            init_args={"stale_while_revalidate": 10},
+            config_args={"expiration_time": None},
+        )
+        reg.get_or_create("some key", lambda: "some value")
+        reg.invalidate(hard=False)
+        assert_raises_message(
+            exception.DogpileCacheException,
+            "Non-None expiration time required for soft invalidation",
+            reg.get_or_create,
+            "some key",
+            lambda: "new value",
+        )
+        eq_(reg.stats.stale_hits, 0)
+
+    def test_backend_error_propagates(self):
+        reg = self._region(init_args={"stale_while_revalidate": 10})
+        with mock.patch.object(
+            reg.backend, "get", side_effect=RuntimeError("boom")
+        ):
+            assert_raises_message(
+                RuntimeError,
+                "boom",
+                reg.get_or_create,
+                "some key",
+                lambda: "some value",
+            )
+        with mock.patch.object(
+            reg.backend, "get_multi", side_effect=RuntimeError("boom")
+        ):
+            assert_raises_message(
+                RuntimeError,
+                "boom",
+                reg.get_or_create_multi,
+                ["k1", "k2"],
+                lambda *k: ["x" for key in k],
+            )
+
+    def test_stats_reset(self):
+        reg = self._region(init_args={"stale_while_revalidate": 10})
+        reg.get_or_create("some key", lambda: "old value")
+        time.sleep(0.05)
+        reg.invalidate(hard=False)
+        reg.get_or_create("some key", lambda: "new value")
+        eq_(reg.stats.stale_hits, 1)
+        eq_(reg.stats.refreshes, 1)
+        reg.stats.reset()
+        eq_(reg.stats.stale_hits, 0)
+        eq_(reg.stats.refreshes, 0)
+        eq_(reg.stats.refresh_errors, 0)
 
 
 class ProxyRegionTest(RegionTest):
