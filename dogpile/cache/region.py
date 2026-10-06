@@ -72,6 +72,50 @@ FunctionKeyGenerator = Callable[..., Callable[..., KeyType]]
 FunctionMultiKeyGenerator = Callable[..., Callable[..., Sequence[KeyType]]]
 
 
+class RegionStats:
+    """Runtime statistics maintained by a :class:`.CacheRegion`.
+
+    Counters are maintained separately:
+
+    * ``stale_hits`` - number of times a soft-invalidated value was served
+      while still within the stale-while-revalidate window.
+    * ``refreshes`` - number of successful value refreshes triggered by the
+      stale-while-revalidate policy.
+    * ``refresh_errors`` - number of failed refresh attempts where the stale
+      value kept being served instead.
+
+    .. versionadded:: 1.6.0
+
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.stale_hits: int = 0
+        self.refreshes: int = 0
+        self.refresh_errors: int = 0
+
+    def _incr(self, counter: str, count: int = 1) -> None:
+        with self._lock:
+            setattr(self, counter, getattr(self, counter) + count)
+
+    def reset(self) -> None:
+        """Reset all counters to zero."""
+
+        with self._lock:
+            self.stale_hits = 0
+            self.refreshes = 0
+            self.refresh_errors = 0
+
+    def __getitem__(self, key: str) -> int:
+        return cast(int, getattr(self, key))
+
+    def __repr__(self) -> str:
+        return (
+            "RegionStats(stale_hits=%d, refreshes=%d, refresh_errors=%d)"
+            % (self.stale_hits, self.refreshes, self.refresh_errors)
+        )
+
+
 class RegionInvalidationStrategy:
     """Region invalidation strategy interface
 
@@ -113,6 +157,9 @@ class RegionInvalidationStrategy:
             def is_soft_invalidated(self, timestamp):
                 return (self._soft_invalidated and
                         timestamp < self._soft_invalidated)
+
+            def soft_invalidation_time(self):
+                return self._soft_invalidated
 
     The custom implementation is injected into a :class:`.CacheRegion`
     at configure time using the
@@ -206,6 +253,24 @@ class RegionInvalidationStrategy:
 
         raise NotImplementedError()
 
+    def soft_invalidation_time(self) -> float | None:
+        """Return the timestamp of the most recent soft invalidation.
+
+        This is used by the stale-while-revalidate policy to determine
+        whether a soft-invalidated value is still within its
+        "serve stale" window.
+
+        :return: Float timestamp, or None if the region is not currently
+         soft invalidated, or if the strategy cannot determine the time.
+         When None is returned, the stale-while-revalidate window is
+         considered to not be bounded by the invalidation time.
+
+         .. versionadded:: 1.6.0
+
+        """
+
+        return None
+
 
 class DefaultInvalidationStrategy(RegionInvalidationStrategy):
     def __init__(self):
@@ -230,6 +295,11 @@ class DefaultInvalidationStrategy(RegionInvalidationStrategy):
 
     def is_soft_invalidated(self, timestamp: float) -> bool:
         return self.was_soft_invalidated() and self.is_invalidated(timestamp)
+
+    def soft_invalidation_time(self) -> float | None:
+        if self.was_soft_invalidated():
+            return self._invalidated
+        return None
 
 
 class CacheRegion:
@@ -394,6 +464,31 @@ class CacheRegion:
      .. versionadded:: 0.4.2 added the async_creation_runner
         feature.
 
+    :param stale_while_revalidate: Optional. A number of seconds. When set
+     together with a non-None ``expiration_time``, a value that has been
+     soft-invalidated via :meth:`.CacheRegion.invalidate` continues to be
+     served for this many seconds after the soft invalidation, while a
+     single request is allowed to refresh the value in the background (when
+     ``async_creation_runner`` is configured) or in the foreground. If the
+     refresh fails, the stale value keeps being served until the entry is
+     hard-invalidated (including by normal expiration time). Once the window
+     is exceeded, or when the expiration time is None, ordinary dogpile
+     regeneration semantics apply.
+
+     .. versionadded:: 1.6.0
+
+     .. seealso::
+
+        :paramref:`.CacheRegion.single_flight`
+
+    :param single_flight: When ``stale_while_revalidate`` is in effect, if
+     True (the default), only one thread/process refreshes a given key at a
+     time; all other concurrent requests are served the stale value
+     immediately. If False, requests block on the key lock and receive the
+     rebuilt value once the current refresh completes.
+
+     .. versionadded:: 1.6.0
+
     """
 
     def __init__(
@@ -405,6 +500,8 @@ class CacheRegion:
         serializer: Callable[[ValuePayload], bytes] | None = None,
         deserializer: Callable[[bytes], ValuePayload] | None = None,
         async_creation_runner: AsyncCreator | None = None,
+        stale_while_revalidate: float | None = None,
+        single_flight: bool = True,
     ):
         """Construct a new :class:`.CacheRegion`."""
         self.name = name
@@ -414,6 +511,9 @@ class CacheRegion:
         self.serializer = self._user_defined_serializer = serializer
         self.deserializer = self._user_defined_deserializer = deserializer
         self.async_creation_runner = async_creation_runner
+        self.stale_while_revalidate = stale_while_revalidate
+        self.single_flight = single_flight
+        self.stats = RegionStats()
         self.region_invalidator: RegionInvalidationStrategy = (
             DefaultInvalidationStrategy()
         )
@@ -925,6 +1025,149 @@ class CacheRegion:
 
         return True
 
+    def _swr_applies(self, expiration_time: float | None) -> bool:
+        """Return True if the stale-while-revalidate policy is in effect.
+
+        The policy requires a ``stale_while_revalidate`` window as well as
+        a non-None expiration time; when the expiration time is None (never
+        expires), ordinary invalidation semantics apply.
+        """
+
+        return (
+            self.stale_while_revalidate is not None
+            and expiration_time is not None
+        )
+
+    def _swr_within_window(self, now: float) -> bool:
+        soft_time = self.region_invalidator.soft_invalidation_time()
+        return (
+            soft_time is None
+            or now - soft_time <= cast(float, self.stale_while_revalidate)
+        )
+
+    def _swr_stale_value(
+        self,
+        value: CacheReturnType,
+        orig_key: KeyType,
+        expiration_time: float,
+        now: float,
+    ) -> CachedValue | None:
+        """Return the value as a :class:`.CachedValue` if it may be served
+        stale under the stale-while-revalidate policy, else None."""
+
+        if self._is_cache_miss(value, orig_key):
+            return None
+        cached_value = cast(CachedValue, value)
+        ct = cached_value.metadata["ct"]
+        if not self.region_invalidator.is_soft_invalidated(ct):
+            return None
+        if now - ct > expiration_time:
+            # expiration by timeout is a hard invalidation; the full
+            # regeneration path applies.
+            return None
+        if not self._swr_within_window(now):
+            return None
+        return cached_value
+
+    def _swr_serve_stale(
+        self,
+        key: KeyType,
+        orig_key: KeyType,
+        stale_value: CachedValue,
+        creator: Callable[..., ValuePayload],
+        should_cache_fn: Callable[[ValuePayload], bool] | None,
+        creator_args: tuple[Any, Mapping[str, Any]] | None,
+    ) -> ValuePayload:
+        """Serve a stale value, electing a single request to refresh it.
+
+        The refresh may happen in the background (when an
+        ``async_creation_runner`` is configured) or synchronously in the
+        elected request.  A failed refresh leaves the cached entry in place
+        and the stale value is served instead.
+        """
+
+        mutex = self._mutex(key)
+        if self.single_flight:
+            if not mutex.acquire(False):
+                # another thread/process is refreshing; serve stale
+                log.debug(
+                    "Refresh in progress elsewhere for key: %r, "
+                    "returning stale value",
+                    orig_key,
+                )
+                self.stats._incr("stale_hits")
+                return stale_value.payload
+        else:
+            mutex.acquire(True)
+            try:
+                current = self._get_from_backend(key)
+            except Exception:
+                mutex.release()
+                raise
+            if not self._is_cache_miss(current, orig_key):
+                ct = cast(CachedValue, current).metadata["ct"]
+                if not self.region_invalidator.is_soft_invalidated(ct):
+                    # a concurrent request refreshed the value while we
+                    # waited on the lock
+                    mutex.release()
+                    return cast(CachedValue, current).payload
+
+        if self.async_creation_runner is not None:
+            # hand the refresh off to the background runner, which is
+            # responsible for releasing the mutex.
+            acr = self.async_creation_runner
+
+            if creator_args:
+                ca = creator_args
+
+                @wraps(creator)
+                def go():
+                    return creator(*ca[0], **ca[1])
+
+            else:
+                go = creator  # type: ignore
+
+            def tracked_creator():
+                try:
+                    result = go()
+                except Exception:
+                    self.stats._incr("refresh_errors")
+                    raise
+                else:
+                    self.stats._incr("refreshes")
+                    return result
+
+            acr(self, orig_key, tracked_creator, mutex)
+            self.stats._incr("stale_hits")
+            return stale_value.payload
+
+        try:
+            with self._log_time(orig_key):
+                if creator_args:
+                    new_payload = creator(*creator_args[0], **creator_args[1])
+                else:
+                    new_payload = creator()
+        except Exception:
+            # a failed refresh must not remove the existing entry; the
+            # stale value remains available until hard invalidation.
+            log.debug(
+                "Refresh failed for key: %r, returning stale value",
+                orig_key,
+                exc_info=True,
+            )
+            self.stats._incr("refresh_errors")
+            self.stats._incr("stale_hits")
+            return stale_value.payload
+        else:
+            if should_cache_fn is None or should_cache_fn(new_payload):
+                self._set_cached_value_to_backend(
+                    key, self._value(new_payload)
+                )
+            self.stats._incr("refreshes")
+            return new_payload
+        finally:
+            mutex.release()
+
     def key_is_locked(self, key: KeyType) -> bool:
         """Return True if a particular cache key is currently being generated
         within the dogpile lock.
@@ -1075,6 +1318,23 @@ class CacheRegion:
         if expiration_time == -1:
             expiration_time = None
 
+        if self._swr_applies(expiration_time):
+            stale_value = self._swr_stale_value(
+                self._get_from_backend(key),
+                orig_key,
+                cast(float, expiration_time),
+                time.time(),
+            )
+            if stale_value is not None:
+                return self._swr_serve_stale(
+                    key,
+                    orig_key,
+                    stale_value,
+                    creator,
+                    should_cache_fn,
+                    creator_args,
+                )
+
         async_creator: Callable[[CacheMutex], AsyncCreator] | None
         if self.async_creation_runner:
             acr = self.async_creation_runner
@@ -1202,7 +1462,57 @@ class CacheRegion:
 
         mutexes: Mapping[KeyType, Any] = {}
 
+        # stale-while-revalidate: keys holding a soft-invalidated value
+        # that is still within the serve-stale window are handled here;
+        # they are served stale while a single request refreshes them.
+        swr_stale_keys = set()
+        swr_refresh_mutexes: dict[KeyType, Any] = {}
+        swr_served_stale = 0
+        if self._swr_applies(expiration_time):
+            now = time.time()
+            for swr_orig_key, swr_mangled_key in orig_to_mangled.items():
+                if (
+                    self._swr_stale_value(
+                        values.get(swr_mangled_key, NO_VALUE),
+                        swr_orig_key,
+                        cast(float, expiration_time),
+                        now,
+                    )
+                    is not None
+                ):
+                    swr_stale_keys.add(swr_orig_key)
+
+            # acquire in sorted key order, to prevent deadlocks between
+            # concurrent multi-key refreshes when single_flight is False
+            for swr_orig_key in sorted(swr_stale_keys):
+                swr_mangled_key = orig_to_mangled[swr_orig_key]
+                swr_mutex = self._mutex(swr_mangled_key)
+                if self.single_flight:
+                    if not swr_mutex.acquire(False):
+                        # another thread/process is refreshing this key
+                        swr_served_stale += 1
+                        continue
+                else:
+                    swr_mutex.acquire(True)
+                    try:
+                        current = self._get_from_backend(swr_mangled_key)
+                    except Exception:
+                        swr_mutex.release()
+                        raise
+                    if not self._is_cache_miss(current, swr_orig_key):
+                        ct = cast(CachedValue, current).metadata["ct"]
+                        if not self.region_invalidator.is_soft_invalidated(
+                            ct
+                        ):
+                            # refreshed concurrently while we waited
+                            swr_mutex.release()
+                            values[swr_mangled_key] = current
+                            continue
+                swr_refresh_mutexes[swr_orig_key] = swr_mutex
+
         for orig_key, mangled_key in orig_to_mangled.items():
+            if orig_key in swr_stale_keys:
+                continue
             with Lock(
                 self._mutex(mangled_key),
                 gen_value,
@@ -1249,6 +1559,48 @@ class CacheRegion:
                     )
 
                 values.update(values_w_created)
+            if swr_refresh_mutexes:
+                try:
+                    keys_to_refresh = sorted(swr_refresh_mutexes)
+                    try:
+                        with self._log_time(keys_to_refresh):
+                            refreshed_values = creator(*keys_to_refresh)
+                    except Exception:
+                        # a failed refresh must not remove the existing
+                        # entries; the stale values remain available until
+                        # hard invalidation.
+                        log.debug(
+                            "Refresh failed for keys: %r, returning stale "
+                            "values",
+                            keys_to_refresh,
+                            exc_info=True,
+                        )
+                        self.stats._incr("refresh_errors")
+                        swr_served_stale += len(keys_to_refresh)
+                    else:
+                        values_w_refreshed = {
+                            orig_to_mangled[k]: self._value(v)
+                            for k, v in zip(keys_to_refresh, refreshed_values)
+                        }
+                        if should_cache_fn:
+                            self._set_multi_cached_value_to_backend(
+                                {
+                                    k: v
+                                    for k, v in values_w_refreshed.items()
+                                    if should_cache_fn(v.payload)
+                                }
+                            )
+                        else:
+                            self._set_multi_cached_value_to_backend(
+                                values_w_refreshed
+                            )
+                        self.stats._incr("refreshes")
+                        values.update(values_w_refreshed)
+                finally:
+                    for swr_mutex in swr_refresh_mutexes.values():
+                        swr_mutex.release()
+            if swr_served_stale:
+                self.stats._incr("stale_hits", swr_served_stale)
             return [values[orig_to_mangled[k]].payload for k in keys]
         finally:
             for mutex in mutexes.values():
